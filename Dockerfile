@@ -1,13 +1,17 @@
 # LTS (as of 2024/03)
 FROM node:20
 
+# Add required LABELS
+LABEL org.opencontainers.image.source=https://github.com/Sproglet/MarkerEditorForPlex
+
 # Set production env
 ARG NODE_ENV=production
-ENV NODE_ENV $NODE_ENV
+ENV NODE_ENV=$NODE_ENV
 
 # Copy package[-lock].json to install dependencies
 COPY package*.json ./
 RUN npm ci && npm cache clean --force
+RUN apt update && apt full-upgrade -y && apt install -y ffmpeg
 
 # Copy everything else over
 COPY . .

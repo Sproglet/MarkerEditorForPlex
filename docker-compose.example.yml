@@ -1,0 +1,14 @@
+services:
+    intro-editor-for-plex:
+        ports:
+            - 3232:3232
+        volumes:
+            - ./plex-marker-editor:/Data
+            - path_to_plex/Library/Application Support/Plex Media Server:/PlexDataDirectory
+            - /TV:/TV:ro # Media paths
+            - /Movies:/Movies:ro # should be exactly the same
+            - /media:/media:ro # on both sides
+        container_name: intro-editor-for-plex
+        stdin_open: true
+        tty: true
+        image: ghcr.io/sproglet/intro-editor-for-plex:latest
