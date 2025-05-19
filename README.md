@@ -18,7 +18,7 @@ docker run -p 3233:3232 \
  -it ghcr.io/sproglet/intro-editor-for-plex:latest 
 
 ``` 
-Alternatively download the docker-compose.yml file (https://raw.githubusercontent.com/Sproglet/MarkerEditorForPlex/refs/heads/main/docker-compose.yml) and modify for your paths. 
+Alternatively download the docker-compose.yml file (https://raw.githubusercontent.com/Sproglet/MarkerEditorForPlex/refs/heads/main/docker-compose.example.yml) and modify for your paths. 
 
 For platforms that don't have a binary release available (or to run from source): 
 1. Install [Node.js](https://nodejs.org/en/) 
