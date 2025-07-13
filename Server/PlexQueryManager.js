@@ -6,6 +6,7 @@ import { ConsoleLog, ContextualLog } from '../Shared/ConsoleLog.js';
 import { MarkerEnum, MarkerType } from '../Shared/MarkerType.js';
 
 import MarkerEditCache from './MarkerEditCache.js';
+import { MediaAnalysisWriter } from './MediaAnalysisWriter.js';
 import ServerError from './ServerError.js';
 import SqliteDatabase from './SqliteDatabase.js';
 import TransactionBuilder from './TransactionBuilder.js';
@@ -184,6 +185,9 @@ class PlexQueryManager {
 
     /** @type {SqliteDatabase} */
     #database;
+
+    /** @type {boolean} */
+    #writeExtraData;
 
     /** The default fields to return for an individual marker, which includes the episode/season/show/section id. */
     #extendedEpisodeMarkerFields = `
@@ -369,6 +373,16 @@ FROM taggings
 
     markerTagId() { return this.#markerTagId; }
     database() { return this.#database; }
+    async checkWriteExtraData(writeExtraData) {
+        if (writeExtraData && (ExtraData.isLegacy || !(await MediaAnalysisWriter.hasExpectedData(this.#database)))) {
+            this.#writeExtraData = false;
+            Log.error('Cannot enable writeExtraData with legacy extra_data format. Disabling.');
+            return false;
+        }
+
+        this.#writeExtraData = writeExtraData;
+        return true;
+    }
 
     /** Retrieve all movie and TV show libraries in the database.
      *
@@ -506,37 +520,23 @@ ORDER BY e.\`index\` ASC;`;
 
     /**
      * Retrieve episode info for each of the episode ids in `episodeMetadataIds`
-     * @param {Set<number>} episodeMetadataIds
+     * @param {number[]} episodeMetadataIds
      * @param {number} metadataId The parent id for all episodes
      * @returns {Promise<RawEpisodeData[]>}*/
-    async getEpisodesFromList(episodeMetadataIds, metadataId) {
-        if (episodeMetadataIds.size === 0) {
+    getEpisodesFromList(episodeMetadataIds) {
+        if (episodeMetadataIds.length === 0) {
             Log.warn('Why are we calling getEpisodesFromList with an empty list?');
             return [];
         }
 
-        // With many ids, it can be faster to just grab all ids from the parent and filter it ourselves.
-        // On top of that, the DB can only handle so many WHERE conditions before it errors out.
-        if (episodeMetadataIds.size > 500) {
-            if (!metadataId) {
-                Log.warn(`Too many episodes in getEpisodesFromList without a fallback metadata id, batching calls`);
-                let index = 0;
-                /** @type {RawEpisodeData[]} */
-                const episodes = [];
-                const ids = Array.from(episodeMetadataIds);
-                while (index <= ids.length) {
-                    episodes.push(...(await this.getEpisodesFromList(new Set(ids.slice(index, Math.min(index + 500, ids.length))))));
-                    index += 500;
-                }
-
-                return episodes;
-            }
-
-            const episodes = await this.getEpisodesAuto(metadataId);
-            return episodes.filter(e => episodeMetadataIds.has(e.id));
+        const validIds = episodeMetadataIds.filter(id => !isNaN(id));
+        if (validIds.length !== episodeMetadataIds.length) {
+            const invalidCount = episodeMetadataIds.length - validIds.length;
+            const invalidIds = episodeMetadataIds.filter(isNaN);
+            Log.warn(`getEpisodesFromList: ${invalidCount} invalid episode ids found (${invalidIds.join(', ')}), skipping them`);
         }
 
-        let query = `
+        const query = `
     SELECT
         e.title AS title,
         e.\`index\` AS \`index\`,
@@ -550,47 +550,20 @@ ORDER BY e.\`index\` ASC;`;
         INNER JOIN metadata_items p ON e.parent_id=p.id
         INNER JOIN metadata_items g ON p.parent_id=g.id
         INNER JOIN media_items m ON e.id=m.metadata_item_id
-    WHERE (`;
-
-        const parameters = [];
-        for (const episodeId of episodeMetadataIds) {
-            if (isNaN(episodeId)) {
-                Log.warn(`Can't get episode information for non-integer id ${episodeId}`);
-                continue;
-            }
-
-            parameters.push(episodeId);
-            query += `e.id=? OR `;
-        }
-
-        query = query.substring(0, query.length - 4);
-        query += `)
+    WHERE e.id IN (${validIds.join(',')})
     GROUP BY e.id
     ORDER BY e.\`index\` ASC;`;
 
-        return this.#database.all(query, parameters);
+        return this.#database.all(query);
     }
 
     /**
      * Retrieve movie info for each of the movie ids in `movieMetadataIds`
      * @param {number[]} movieMetadataIds
      * @returns {Promise<RawMovieData[]>}*/
-    async getMoviesFromList(movieMetadataIds) {
+    getMoviesFromList(movieMetadataIds) {
 
-        // For large queries, do it in batches to get around SQLite's condition limits
-        if (movieMetadataIds.length > 500) {
-            let index = 0;
-            /** @type {RawMovieData[]} */
-            const movies = [];
-            while (index < movieMetadataIds.length) {
-                movies.concat(await this.getMoviesFromList(movieMetadataIds.slice(index, Math.min(movieMetadataIds.length, index + 500))));
-                index += 500;
-            }
-
-            return movies;
-        }
-
-        let query = `
+        const query = `
     SELECT movies.id AS id,
         movies.title AS title,
         movies.title_sort AS title_sort,
@@ -598,22 +571,12 @@ ORDER BY e.\`index\` ASC;`;
         movies.year AS year,
         movies.edition_title AS edition,
         MAX(files.duration) AS duration
-  FROM metadata_items movies
-  INNER JOIN media_items files ON movies.id=files.metadata_item_id
-  WHERE (`;
-
-        const parameters = [];
-        for (const movieId of movieMetadataIds) {
-            parameters.push(movieId);
-            query += `movies.id=? OR `;
-        }
-
-        // Trim final ' OR '
-        query = query.substring(0, query.length - 4) + `)
+    FROM metadata_items movies
+    INNER JOIN media_items files ON movies.id=files.metadata_item_id
+    WHERE movies.id IN (${movieMetadataIds.join(',')})
     GROUP BY movies.id
     ORDER BY movies.title_sort ASC;`;
-
-        return this.#database.all(query, parameters);
+        return this.#database.all(query);
     }
 
     /**
@@ -693,39 +656,23 @@ ORDER BY e.\`index\` ASC;`;
      * Retrieve all markers for the given mediaIds, which should all be either episodes
      * or movies (and not mixed).
      * @param {number[]} metadataIds
-     * @param {number} sectionId Used in cases where we have too many metadataIds to initially grab all markers
-     *                           for the section, and then filter to the given metadataIds.
      * @returns {Promise<RawMarkerData[]>}*/
-    async getMarkersForItems(metadataIds, sectionId) {
-        if (metadataIds.length <= 500) {
-            const metadataType = await this.#validateSameMetadataTypes(metadataIds);
-            if (metadataType === MetadataType.Invalid) {
-                throw new ServerError(`getMarkersForItems can only accept metadata ids that are the same metadata_type`, 400);
-            }
+    async getMarkersForItems(metadataIds) {
+        const metadataType = await this.#validateSameMetadataTypes(metadataIds);
+        if (metadataType === MetadataType.Invalid) {
+            throw new ServerError(`getMarkersForItems can only accept metadata ids that are the same metadata_type`, 400);
+        }
 
-            switch (metadataType) {
-                case MetadataType.Movie:
-                    return this.#getMarkersForEpisodesOrMovies(metadataIds, this.#extendedMovieMarkerFields);
-                case MetadataType.Episode:
-                    return this.#getMarkersForEpisodesOrMovies(metadataIds, this.#extendedEpisodeMarkerFields);
-                default:
-                {
-                    const typeString = Object.keys(MetadataType).find(k => MetadataType[k] === metadataType);
-                    throw new ServerError(`getMarkersForItems only expects movie or episode ids, found ${typeString}.`, 400);
-                }
+        switch (metadataType) {
+            case MetadataType.Movie:
+                return this.#getMarkersForEpisodesOrMovies(metadataIds, this.#extendedMovieMarkerFields);
+            case MetadataType.Episode:
+                return this.#getMarkersForEpisodesOrMovies(metadataIds, this.#extendedEpisodeMarkerFields);
+            default:
+            {
+                const typeString = Object.keys(MetadataType).find(k => MetadataType[k] === metadataType);
+                throw new ServerError(`getMarkersForItems only expects movie or episode ids, found ${typeString}.`, 400);
             }
-        } else {
-            // Too many individual ids to account for. Grab all items in the given section and filter accordingly.
-            const allMarkers = await this.#getMarkersForSection(sectionId, (await this.#mediaTypeFromId(metadataIds[0])).metadata_type);
-            const idSet = new Set(metadataIds);
-            const filtered = [];
-            for (const marker of allMarkers) {
-                if (idSet.has(marker.parent_id)) {
-                    filtered.push(marker);
-                }
-            }
-
-            return this.#postProcessExtendedMarkerFields(filtered);
         }
     }
 
@@ -734,29 +681,17 @@ ORDER BY e.\`index\` ASC;`;
      * @param {number[]} mediaIds
      * @param {string} extendedFields */
     async #getMarkersForEpisodesOrMovies(mediaIds, extendedFields) {
-        let query = `SELECT ${extendedFields} WHERE taggings.tag_id=? AND (`;
-        mediaIds.forEach((mediaId, index) => {
-            if (isNaN(mediaId)) {
-                // Don't accept bad keys, but don't fail the entire operation either.
-                Log.warn(mediaId, 'Found bad key in queryIds, skipping');
-                return;
-            }
+        const validIds = mediaIds.filter(id => !isNaN(id));
+        if (validIds.length !== mediaIds.length) {
+            const invalidCount = mediaIds.length - validIds.length;
+            const invalidIds = mediaIds.filter(isNaN);
+            Log.warn(`getMarkersForEpisodesOrMovies: ${invalidCount} invalid media ids found (${invalidIds.join(', ')}), skipping them`);
+        }
 
-            // This query only works if we have relatively few ids to query, otherwise we run into
-            // SQL condition limits. The caller should have verified this already.
-            if (index > 500) {
-                if (index === 501) {
-                    Log.error(`Over 500 ids requested in getMarkersForEpisodesOrMovies, ignoring subsequent calls`);
-                }
-
-                return;
-            }
-
-            query += 'metadata_item_id=' + mediaId + ' OR ';
-        });
-
-        // Strip trailing ' OR '
-        query = query.substring(0, query.length - 4) + ') ORDER BY taggings.time_offset ASC;';
+        const query = `
+            SELECT ${extendedFields}
+            WHERE taggings.tag_id=? AND metadata_item_id IN (${validIds.join(',')})
+            ORDER BY taggings.time_offset ASC;`;
 
         return this.#postProcessExtendedMarkerFields(await this.#database.all(query, [this.#markerTagId]));
     }
@@ -853,18 +788,15 @@ ORDER BY e.\`index\` ASC;`;
             return MetadataType.Invalid;
         }
 
-        let query = 'SELECT metadata_type, library_section_id AS section_id FROM metadata_items WHERE (';
-        for (const metadataId of metadataIds) {
-            if (isNaN(metadataId)) {
-                Log.warn(metadataId, 'Invalid metadata id in validateSameMetadataTypes');
-                return MetadataType.Invalid;
-            }
-
-            query += `id=${metadataId} OR `;
+        const invalidKeys = metadataIds.filter(isNaN);
+        if (invalidKeys.length > 0) {
+            Log.warn(`Invalid metadata id(s) found in validateSameMetadataTypes: ${invalidKeys.join(', ')}`);
+            return MetadataType.Invalid;
         }
 
-        // Strip trailing ' OR '
-        query = query.substring(0, query.length - 4) + ');';
+        const query = `SELECT metadata_type, library_section_id AS section_id FROM metadata_items
+            WHERE id IN (${metadataIds.join(',')});`;
+
         /** @type {MetadataItemTypeInfo[]} */
         const items = await this.#database.all(query);
         if (items.length !== metadataIds.length) {
@@ -938,31 +870,8 @@ ORDER BY e.\`index\` ASC;`;
         }
 
         const markerFields = this.#extendedFieldsFromMediaType((await this.#mediaTypeFromMarkerId(markerIds[0])).metadata_type);
-        const queryChunk = async (/**@type {Set<number>}*/ids) => {
-            if (ids.size === 0) {
-                return [];
-            }
-
-            const params = [];
-            let query = `SELECT ${markerFields} WHERE (`;
-            for (const id of ids) {
-                query += ` taggings.id=? OR`;
-                params.push(id);
-            }
-
-            query = query.substring(0, query.length - 3);
-            query += `) AND taggings.tag_id=?`;
-            params.push(this.#markerTagId);
-            return this.#postProcessExtendedMarkerFields(await this.#database.all(query, params));
-        };
-
-        /** @type {RawMarkerData[]} */
-        const markers = [];
-        for (let index = 0; index < markerIds.length; index += 500) {
-            markers.push(...(await queryChunk(new Set(markerIds.slice(index, Math.min(index + 500, markerIds.length))))));
-        }
-
-        return markers;
+        const query = `SELECT ${markerFields} WHERE taggings.id IN (${markerIds.join(',')}) AND taggings.tag_id=?;`;
+        return this.#postProcessExtendedMarkerFields(await this.#database.all(query, [this.#markerTagId]));
     }
 
     /**
@@ -999,7 +908,7 @@ ORDER BY e.\`index\` ASC;`;
         }
 
         const allMarkers = await this.getBaseTypeMarkers(metadataId);
-        const newIndex = this.#reindexForAdd(allMarkers, startMs, endMs);
+        const newIndex = this.#reindexForAdd(allMarkers, startMs, endMs, markerType);
         if (newIndex === -1) {
             throw new ServerError('Overlapping markers. The existing marker should be expanded to include this range instead.', 400);
         }
@@ -1018,6 +927,10 @@ ORDER BY e.\`index\` ASC;`;
             endMs,
             markerType,
             final);
+
+        if (this.#writeExtraData) {
+            await this.#addRewriteStatement(transaction, metadataId, allMarkers);
+        }
 
         await transaction.exec();
 
@@ -1088,6 +1001,20 @@ ORDER BY e.\`index\` ASC;`;
         };
 
         transaction.addStatement(addQuery, parameters);
+    }
+
+    /**
+     * @param {TransactionBuilder} transaction
+     * @param {number} metadataId
+     * @param {MarkerData[]} allMarkers */
+    async #addRewriteStatement(transaction, metadataId, allMarkers) {
+        if (ExtraData.isLegacy || !this.#writeExtraData) {
+            return;
+        }
+
+        for (const extraData of await (new MediaAnalysisWriter(metadataId, this.#database)).getExtraData(allMarkers)) {
+            transaction.addStatement(extraData.query, extraData.parameters);
+        }
     }
 
     /**
@@ -1434,9 +1361,10 @@ ORDER BY e.\`index\` ASC;`;
      * Is it worth ripping out?
      * @param {RawMarkerData[]} markers
      * @param {number} newStart The start time of the new marker, in milliseconds.
-     * @param {number} newEnd The end time of the new marker, in milliseconds.*/
-    #reindexForAdd(markers, newStart, newEnd) {
-        const pseudoData = { start : newStart, end : newEnd };
+     * @param {number} newEnd The end time of the new marker, in milliseconds.
+     * @returns {number} The new marker index, or -1 if the reindex results in overlap. */
+    #reindexForAdd(markers, newStart, newEnd, markerType) {
+        const pseudoData = { start : newStart, end : newEnd, marker_type : markerType };
         markers.push(pseudoData);
         markers.sort((a, b) => a.start - b.start).forEach((marker, index) => {
             marker.newIndex = index;
@@ -1553,11 +1481,9 @@ ORDER BY e.\`index\` ASC;`;
 
         const transaction = new TransactionBuilder(this.#database);
         let expectedShifts = 0;
-        let backupSection = undefined;
         for (const episodeMarkers of Object.values(markers)) {
             for (const marker of episodeMarkers) {
                 ++expectedShifts;
-                backupSection ??= marker.section_id;
                 const maxDuration = limits[marker.parent_id];
                 if (!maxDuration) {
                     throw new ServerError(`Unable to find max episode duration, ` +
@@ -1580,7 +1506,7 @@ ORDER BY e.\`index\` ASC;`;
         }
 
         await transaction.exec();
-        const newMarkers = await this.getMarkersForItems(episodeIds, backupSection);
+        const newMarkers = await this.getMarkersForItems(episodeIds);
         // No ignored markers, no need to prune
         if (newMarkers.length === expectedShifts) {
             return newMarkers;
