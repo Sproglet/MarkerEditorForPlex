@@ -13,13 +13,15 @@ const ServerState = {
     RunningWithoutConfig : 4,
     /** @readonly Server is in a suspended state. */
     Suspended : 5,
+    /** @readonly Server is suspended due to user inactivity. */
+    AutoSuspended : 6,
     /** @readonly The server is in the process of shutting down. Either permanently or during a restart. */
-    ShuttingDown : 6,
+    ShuttingDown : 7,
     /** Returns whether the server is currently in a static state (i.e. not booting up or shutting down) */
-    Stable : () => StableStates.includes(CurrentState),
+    Stable : () => StableStates.has(CurrentState),
 };
 
-const StableStates = [ ServerState.RunningWithoutConfig, ServerState.Running, ServerState.Suspended ];
+const StableStates = new Set([ServerState.RunningWithoutConfig, ServerState.Running, ServerState.Suspended, ServerState.AutoSuspended]);
 
 /**
  * Indicates whether we're in the middle of shutting down the server, and
